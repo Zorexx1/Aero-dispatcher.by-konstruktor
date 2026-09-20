@@ -1,0 +1,1352 @@
+#!/usr/bin/env python3
+"""
+AeroDispatcher - сервер умной диспетчеризации ОТО + 2D Симулятор + GPS Трекинг.
+"""
+import math
+import time
+import uuid
+import json
+import random
+import logging
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string, Response
+from flask_socketio import SocketIO
+from flask_cors import CORS
+
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'aerodispatch-secret'
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
+
+# ─── КОНСТАНТЫ И ТОЧКИ YANDEX MAPS (Идеально выровнены по фото) ───
+WALK_SPEED = 5.0
+TRUCK_SPEED = 25.0
+REGLEMENT_MIN = 15
+
+POINTS = {
+    "stand_1":  {"name": "Стоянка 1",       "lat": 51.7928, "lon": 55.4545},
+    "stand_2":  {"name": "Стоянка 2",       "lat": 51.7928, "lon": 55.4560},
+    "stand_3":  {"name": "Стоянка 3",       "lat": 51.7928, "lon": 55.4575},
+    "stand_4":  {"name": "Стоянка 4",       "lat": 51.7928, "lon": 55.4590},
+    "stand_5":  {"name": "Стоянка 5",       "lat": 51.7928, "lon": 55.4605},
+    "stand_6":  {"name": "Стоянка 6",       "lat": 51.7928, "lon": 55.4620},
+    "stand_7":  {"name": "Стоянка 7",       "lat": 51.7928, "lon": 55.4635},
+    
+    "bld_1":    {"name": "Здание ТО 1",     "lat": 51.7915, "lon": 55.4525},
+    "truck_n":  {"name": "Спецтранспорт З", "lat": 51.7925, "lon": 55.4525},
+    
+    "terminal": {"name": "Аэровокзал",      "lat": 51.7898, "lon": 55.4575},
+    "disp":     {"name": "Диспетчерская",   "lat": 51.7898, "lon": 55.4585},
+    "truck_s":  {"name": "Спецтранспорт В", "lat": 51.7915, "lon": 55.4615},
+    "bld_2":    {"name": "Здание ТО 2",     "lat": 51.7915, "lon": 55.4630},
+    "atb":      {"name": "АТБ (Техцентр)",  "lat": 51.7905, "lon": 55.4640},
+    
+    "taxi_a":   {"name": "Рулежная А",      "lat": 51.7938, "lon": 55.4555},
+    "taxi_b":   {"name": "Рулежная Б",      "lat": 51.7938, "lon": 55.4595},
+}
+
+FAULT_TYPES = {
+    "engine":       {"name": "Двигатель",   "qual": "engine"},
+    "airframe":     {"name": "Планер",      "qual": "airframe"},
+    "avionics":     {"name": "Авионика",     "qual": "avionics"},
+    "hydraulics":   {"name": "Гидравлика",   "qual": "hydraulics"},
+    "cabin":        {"name": "Салон",        "qual": "cabin"},
+    "landing_gear": {"name": "Шасси",       "qual": "landing_gear"},
+    "apu":          {"name": "ВСУ",          "qual": "apu"},
+}
+
+QUAL_NAMES = {
+    "engine": "Двигатели", "airframe": "Планер", "avionics": "Авионика",
+    "hydraulics": "Гидравлика", "cabin": "Салон", "landing_gear": "Шасси", "apu": "ВСУ"
+}
+
+employees = {}
+requests_db = {}
+assignments_db = {}
+event_log = []
+
+def init_test_employees():
+    global employees
+    employees = {}
+    data = [
+        ("Иванов И.И.",  ["engine", "avionics"],       "atb",      "free"),   
+        ("Петров П.П.",  ["airframe", "cabin"],        "terminal", "free"),   
+        ("Сидоров С.С.", ["avionics"],                 "disp",     "free"),   
+        ("Козлов К.К.",  ["engine", "apu"],            "taxi_a",   "free"),   
+        ("Смирнов А.А.", ["airframe", "landing_gear"], "bld_1",    "free"),   
+        ("Орлов О.О.",   ["avionics", "engine"],       "taxi_b",   "free"),   
+        ("Волков В.В.",  ["cabin"],                    "bld_2",    "free"),   
+        ("Зайцев З.З.",  ["engine", "hydraulics"],     "truck_n",  "free"),   
+        ("Новиков Н.Н.", ["airframe", "hydraulics"],   "truck_s",  "free"),
+        ("Федоров Ф.Ф.", ["landing_gear", "apu"],      "atb",      "free"),
+        ("Алексеев А.А.",["hydraulics", "engine"],     "terminal", "free"),
+        ("Михайлов М.М.",["cabin", "airframe"],        "disp",     "free")
+    ]
+    for name, skills, point_id, status in data:
+        eid = str(uuid.uuid4())[:8]
+        pt = POINTS[point_id]
+        employees[eid] = {
+            "id": eid, "name": name, "skills": skills,
+            "qual_name": " + ".join([QUAL_NAMES.get(q, q) for q in skills]),
+            "lat": pt["lat"], "lon": pt["lon"],
+            "status": status, "current_point": point_id,
+            "target_lat": None, "target_lon": None,
+            "busy_until": None,
+            "last_update": time.time(),
+        }
+
+def log_event(msg):
+    event_log.append({"time": datetime.now().strftime("%H:%M:%S"), "msg": msg})
+    if len(event_log) > 100:
+        event_log.pop(0)
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def find_truck_near(lat, lon):
+    best, best_d = None, 1e9
+    for pid in ("truck_n", "truck_s"):
+        p = POINTS[pid]
+        d = haversine(lat, lon, p["lat"], p["lon"])
+        if d < best_d:
+            best_d, best = d, pid
+    return best, best_d
+
+def calc_eta(emp_lat, emp_lon, target_lat, target_lon):
+    dist = haversine(emp_lat, emp_lon, target_lat, target_lon)
+    truck_pid, truck_dist = find_truck_near(emp_lat, emp_lon)
+    walk_time = (dist / WALK_SPEED) * 60
+    if truck_dist < 0.3:
+        t_to_truck = (truck_dist / WALK_SPEED) * 60
+        ride = haversine(POINTS[truck_pid]["lat"], POINTS[truck_pid]["lon"], target_lat, target_lon)
+        t_ride = (ride / TRUCK_SPEED) * 60
+        truck_time = t_to_truck + t_ride
+        if truck_time < walk_time:
+            return truck_time, dist, True, truck_pid
+    return walk_time, dist, False, None
+
+def find_candidates(stand_id, fault_type):
+    target = POINTS[stand_id]
+    qual = FAULT_TYPES[fault_type]["qual"]
+    cands = []
+    for eid, emp in employees.items():
+        if qual not in emp["skills"]:
+            continue
+        if emp["status"] != "free":
+            continue
+        eta, dist, by_truck, truck_pid = calc_eta(emp["lat"], emp["lon"], target["lat"], target["lon"])
+        if eta <= REGLEMENT_MIN:
+            cands.append({
+                "emp_id": eid, "name": emp["name"], "qual_name": emp["qual_name"],
+                "eta_min": round(eta, 1), "distance_km": round(dist, 3),
+                "by_truck": by_truck, "truck_point": truck_pid, "within_reglement": True,
+            })
+    cands.sort(key=lambda x: x["eta_min"])
+    return cands
+
+def get_stats():
+    free = sum(1 for e in employees.values() if e["status"] == "free")
+    busy = sum(1 for e in employees.values() if e["status"] == "busy")
+    enroute = sum(1 for e in employees.values() if e["status"] == "enroute")
+    return {"free": free, "busy": busy, "enroute": enroute, "total": len(employees)}
+
+def emit_all_state():
+    socketio.emit('state_update', {
+        'employees': list(employees.values()),
+        'points': POINTS,
+        'requests': list(requests_db.values()),
+        'assignments': list(assignments_db.values()),
+        'stats': get_stats(),
+        'events': event_log[-20:],
+    })
+
+def gps_tracking_loop():
+    while True:
+        socketio.sleep(0.5) 
+        moved_any = False
+        state_changed = False
+        for eid, emp in employees.items():
+            if emp["status"] == "enroute" and emp.get("target_lat") and emp.get("target_lon"):
+                dlat = emp["target_lat"] - emp["lat"]
+                dlon = emp["target_lon"] - emp["lon"]
+                dist = math.hypot(dlat, dlon)
+                step = 0.00035 
+                
+                if dist < step:
+                    emp["lat"] = emp["target_lat"]
+                    emp["lon"] = emp["target_lon"]
+                    emp["target_lat"] = None
+                    emp["target_lon"] = None
+                    
+                    has_active = any(a["employee_id"] == eid and a["status"] in ("assigned", "accepted") for a in assignments_db.values())
+                    
+                    if has_active:
+                        emp["status"] = "busy"
+                        log_event(f"Сотрудник {emp['name']} прибыл к ВС и начал работу.")
+                        if emp["name"] != "Иванов И.И.":
+                            emp["busy_until"] = time.time() + random.randint(10, 15)
+                    else:
+                        emp["status"] = "free"
+                        log_event(f"Сотрудник {emp['name']} прибыл на базу.")
+                    state_changed = True
+                else:
+                    emp["lat"] += (dlat/dist) * step
+                    emp["lon"] += (dlon/dist) * step
+                
+                socketio.emit('employee_moved', {"id": eid, "lat": emp["lat"], "lon": emp["lon"], "status": emp["status"]})
+                moved_any = True
+
+            elif emp["status"] == "busy" and emp["name"] != "Иванов И.И.":
+                if emp.get("busy_until") and time.time() > emp["busy_until"]:
+                    for aid, a in assignments_db.items():
+                        if a["employee_id"] == eid and a["status"] in ("assigned", "accepted"):
+                            a["status"] = "completed"
+                            if a["request_id"] in requests_db:
+                                requests_db[a["request_id"]]["status"] = "completed"
+                    
+                    emp["status"] = "enroute"
+                    emp["target_lat"] = POINTS["atb"]["lat"]
+                    emp["target_lon"] = POINTS["atb"]["lon"]
+                    emp["busy_until"] = None
+                    log_event(f"NPC {emp['name']} завершил ремонт и уходит в АТБ.")
+                    state_changed = True
+                
+        if state_changed:
+            emit_all_state()
+        elif moved_any:
+            socketio.emit('state_update', {'stats': get_stats()})
+
+
+# ─── HTML ШАБЛОН ДИСПЕТЧЕРА ───
+HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AeroDispatcher - Диспетчерская ОТО</title>
+<script src="https://api-maps.yandex.ru/2.1/?lang=ru_RU&coordOrder=lat,long"></script>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f1923;--panel:#1a2735;--border:#2a3a4a;--text:#e0e8f0;--accent:#4a9eff;--green:#4caf50;--red:#f44336;--orange:#ff9800;--yellow:#ffd700}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;height:100vh;overflow:hidden}
+header{background:var(--panel);padding:10px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);flex-shrink:0}
+header h1{font-size:18px;color:var(--accent); display:flex; align-items:center;}
+.sim-link{font-size:13px;background:var(--accent);color:#fff;padding:6px 12px;border-radius:4px;text-decoration:none;margin-left:20px;transition:0.2s;}
+.sim-link:hover{background:#3a8eef; box-shadow: 0 0 10px rgba(74, 158, 255, 0.5);}
+header .stats{display:flex;gap:12px;font-size:13px}
+.stat-pill{background:var(--bg);padding:4px 10px;border-radius:12px;border:1px solid var(--border)}
+.stat-pill b{color:var(--accent)}
+main{display:flex;flex:1;overflow:hidden}
+#map{flex:1;height:100%;z-index:1; background:#1a2735;}
+.sidebar{width:380px;background:var(--panel);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden; box-shadow: -5px 0 15px rgba(0,0,0,0.3); z-index:10;}
+.tab-bar{display:flex;border-bottom:1px solid var(--border)}
+.tab-btn{flex:1;padding:12px;border:none;background:none;color:var(--text);cursor:pointer;font-size:13px;border-bottom:2px solid transparent; font-weight:bold; transition:0.2s;}
+.tab-btn:hover{background:rgba(255,255,255,0.05);}
+.tab-btn.active{border-bottom-color:var(--accent);color:var(--accent)}
+.tab-content{flex:1;overflow-y:auto;padding:16px}
+.form-group{margin-bottom:12px}
+.form-group label{display:block;font-size:12px;color:#8899aa;margin-bottom:6px; font-weight:bold;}
+.form-group select,.form-group input{width:100%;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px; outline:none;}
+.form-group select:focus,.form-group input:focus{border-color:var(--accent);}
+.btn{padding:10px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;width:100%; transition:0.2s;}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:#3a8eef; box-shadow: 0 4px 10px rgba(74, 158, 255, 0.3);}
+.btn-green{background:var(--green);color:#fff}
+.btn-green:hover{background:#43a047; box-shadow: 0 4px 10px rgba(76, 175, 80, 0.3);}
+.candidate-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;cursor:pointer; transition:0.2s; position:relative; overflow:hidden;}
+.candidate-card:hover{background:rgba(255,255,255,0.02); transform:translateX(3px);}
+.candidate-name{font-weight:600;font-size:14px;margin-bottom:8px}
+.candidate-info{font-size:12px;color:#8899aa;display:flex;gap:10px; flex-wrap:wrap; margin-bottom:10px; align-items:center;}
+.eta-badge{color:#fff;padding:4px 8px;border-radius:6px;font-size:11px;font-weight:bold;}
+.qual-badge{padding:3px 8px;border-radius:6px;color:#fff;font-weight:bold;font-size:11px;background:rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3);}
+.request-card{background:var(--bg);border:1px solid var(--border);border-left:4px solid var(--orange);border-radius:6px;padding:12px;margin-bottom:10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}
+.request-stand{font-weight:bold;font-size:15px; color:#fff;}
+.request-board{font-size:12px;color:#8899aa; margin-top:4px;}
+.log-entry{font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);color:#aabbcc}
+.log-entry .time{color:#667788;margin-right:8px}
+.test-btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px}
+.test-btn{padding:8px;font-size:11px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:6px;cursor:pointer; font-weight:bold;}
+.test-btn:hover{border-color:var(--accent); background:rgba(74, 158, 255, 0.1);}
+.section-title{font-size:15px;font-weight:bold;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border); color:#fff;}
+.empty{color:#667788;font-size:13px;text-align:center;padding:30px; background:rgba(0,0,0,0.2); border-radius:8px;}
+.notification{position:fixed;top:60px;right:400px;background:var(--green);color:#fff;padding:14px 24px;border-radius:8px;z-index:9999;display:none; font-weight:bold; box-shadow: 0 10px 20px rgba(0,0,0,0.3);}
+
+/* Скрытие всех копирайтов Яндекса */
+[class*="copyright"] { display: none !important; }
+[class*="gototech"] { display: none !important; }
+.ymaps-2-1-79-copyright { display: none !important; }
+
+@keyframes pulse-ring { 0% { transform: scale(0.8); opacity: 0.8; } 100% { transform: scale(3.5); opacity: 0; } }
+@keyframes blink { 50% { opacity: 0.5; } }
+.marker-alert::before { content: ''; position: absolute; top: -10px; left: -10px; right: -10px; bottom: -10px; background: #f44336; border-radius: 50%; z-index: -1; animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite; }
+.marker-moving { animation: blink 1s infinite; }
+</style>
+</head>
+<body>
+<header>
+  <h1>✈ AeroDispatcher <a href="/sim" target="_blank" class="sim-link">🎮 Открыть 2D-Симулятор</a></h1>
+  <div class="stats">
+    <span class="stat-pill">Свободны: <b id="stat-free" style="color:#4caf50;">0</b></span>
+    <span class="stat-pill">В пути: <b id="stat-enroute" style="color:#4a9eff;">0</b></span>
+    <span class="stat-pill">Заняты: <b id="stat-busy" style="color:#f44336;">0</b></span>
+    <span class="stat-pill">Всего: <b id="stat-total" style="color:#fff;">0</b></span>
+  </div>
+</header>
+<main>
+  <div id="map"></div>
+  <div class="sidebar">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="new">Новая заявка</button>
+      <button class="tab-btn" data-tab="active">Активные</button>
+      <button class="tab-btn" data-tab="log">Журнал</button>
+      <button class="tab-btn" data-tab="test">Тесты</button>
+    </div>
+    <div class="tab-content" id="tab-new">
+      <div class="section-title">Создание заявки</div>
+      <div class="form-group"><label>Стоянка ВС</label><select id="stand-select"></select></div>
+      <div class="form-group"><label>Бортовой номер</label><input type="text" id="board-input" value="RA-73785"/></div>
+      <div class="form-group"><label>Тип неисправности</label><select id="fault-select"></select></div>
+      <button class="btn btn-primary" onclick="createRequest()">Найти исполнителя</button>
+      <div class="candidates-list" id="candidates-list"></div>
+    </div>
+    <div class="tab-content" id="tab-active" style="display:none">
+      <div class="section-title">Активные заявки</div>
+      <div id="requests-list"></div>
+    </div>
+    <div class="tab-content" id="tab-log" style="display:none">
+      <div class="section-title">Журнал событий</div>
+      <div id="log-list"></div>
+    </div>
+    <div class="tab-content" id="tab-test" style="display:none">
+      <div class="section-title">Сценарии (Движение)</div>
+      <div class="test-btns">
+        <button class="test-btn" onclick="runTest(1)">1. Все в АТБ</button>
+        <button class="test-btn" onclick="runTest(2)">2. Разброс по перрону</button>
+        <button class="test-btn" onclick="runTest(3)">3. Режим аврала (Busy)</button>
+        <button class="test-btn" onclick="runTest(4)">4. К спецтранспорту</button>
+        <button class="test-btn" onclick="runTest(6)">6. Возврат сотрудников</button>
+        <button class="test-btn" onclick="runTest(7)">7. Сброс заявок</button>
+      </div>
+      <div class="section-title" style="margin-top:16px">Сотрудники (12)</div>
+      <div id="test-emp-list"></div>
+    </div>
+  </div>
+</main>
+<div class="notification" id="notif"></div>
+<script>
+const POINTS = {{ points_json | safe }};
+const FAULTS = {{ faults_json | safe }};
+let map, markers = {}, routeLine = null, currentRequestId = null;
+let socket = io();
+
+socket.on('connect', () => { socket.emit('request_state'); });
+socket.on('state_update', (data) => { updateState(data); });
+socket.on('employee_moved', (data) => {
+  let emp = STATE.employees.find(e => e.id === data.id);
+  if (emp) { emp.lat = data.lat; emp.lon = data.lon; emp.status = data.status; updateEmpMarker(emp); }
+});
+
+let STATE = { employees: [], requests: [], assignments: [], stats: {}, events: [] };
+
+function updateState(data) {
+  if(data.employees) STATE.employees = data.employees;
+  if(data.requests) STATE.requests = data.requests;
+  if(data.assignments) STATE.assignments = data.assignments;
+  if(data.stats) STATE.stats = data.stats;
+  if(data.events) STATE.events = data.events;
+  renderStats(); renderEmployees(); renderRequests(); renderLog(); renderTestEmps(); updateStandAlerts();
+}
+
+function showNotif(msg) {
+  let n = document.getElementById('notif'); n.textContent = msg; n.style.display = 'block'; setTimeout(() => n.style.display = 'none', 3000);
+}
+
+function initMap() {
+  map = new ymaps.Map('map', { center: [51.7915, 55.4580], zoom: 16, type: 'yandex#satellite', controls: ['zoomControl'] });
+  
+  var typeSelector = new ymaps.control.TypeSelector({ mapTypes: ['yandex#satellite', 'yandex#map'] });
+  map.controls.add(typeSelector, {float: 'right'});
+
+  for (var pid in POINTS) {
+    var pt = POINTS[pid];
+    var isATB = pid === 'atb'; var isTruck = pid.startsWith('truck'); var isTerminal = pid === 'terminal'; var isDisp = pid === 'disp';
+    var isTaxi = pid.startsWith('taxi') || pid.startsWith('bld');
+    
+    var svgIcon = '';
+    if(isATB) svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="16" height="16"><path d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.5 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.8.8 2.1.8 2.8 0l.9-.9c.8-.8.8-2.1.1-2.8z"/></svg>';
+    else if(isTruck) svgIcon = '<svg fill="#000" viewBox="0 0 24 24" width="16" height="16"><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm13.5-9l1.96 2.5H17V9.5h2.5zm-1.5 9c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>';
+    else if(isTerminal) svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="16" height="16"><path d="M12 2L2 22h20L12 2zm0 3.8l6.2 14.2H5.8L12 5.8zM11 10v4h2v-4h-2zm0 5v2h2v-2h-2z"/></svg>';
+    else if(isDisp || isTaxi) svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="8"/></svg>';
+    else svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="18" height="18"><path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>';
+    
+    var bgColor = isATB ? '#ff9800' : isTruck ? '#ffd700' : isTerminal ? '#4caf50' : (isDisp || isTaxi) ? '#9c27b0' : '#4a9eff';
+    
+    var pointLayout = ymaps.templateLayoutFactory.createClass('<div style="position:relative; display:flex;flex-direction:column;align-items:center;"><div id="stand_alert_' + pid + '" style="position:relative; width:34px;height:34px;border-radius:50%;background:' + bgColor + ';display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 4px 10px rgba(0,0,0,0.5);">' + svgIcon + '</div><div style="font-size:10px;color:#fff;background:rgba(0,0,0,0.8);padding:2px 6px;border-radius:4px;margin-top:4px; font-weight:bold;">' + pt.name + '</div></div>');
+    var pm = new ymaps.Placemark([pt.lat, pt.lon], {balloonContent: pt.name, alertClass: ''}, {iconLayout: pointLayout, iconShape: {type: 'Rectangle', coordinates: [[-20, -20], [20, 20]]}});
+    map.geoObjects.add(pm); markers[pid] = pm;
+  }
+  renderEmployees();
+}
+
+function updateStandAlerts() {
+  if (!map) return;
+  for (var pid in POINTS) {
+      if(pid.startsWith('stand')) {
+          let el = document.getElementById('stand_alert_' + pid);
+          if(el) el.className = '';
+      }
+  }
+  for (var req of STATE.requests) {
+      if(req.status === 'open' || req.status === 'assigned') {
+          let el = document.getElementById('stand_alert_' + req.stand_id);
+          if(el) el.className = 'marker-alert';
+      }
+  }
+}
+
+function updateEmpMarker(emp) {
+  if (!map) return;
+  if (markers['emp_' + emp.id]) map.geoObjects.remove(markers['emp_' + emp.id]);
+  var colors = { free: '#4caf50', busy: '#f44336', enroute: '#4a9eff', assigned: '#ff9800' };
+  var initials = emp.name.split(' ').map(w => w[0]).join('');
+  var color = colors[emp.status] || '#888';
+  var moveClass = emp.status === 'enroute' ? 'marker-moving' : '';
+  
+  var empLayout = ymaps.templateLayoutFactory.createClass('<div class="' + moveClass + '" style="display:flex;flex-direction:column;align-items:center;"><div style="width:26px;height:26px;border-radius:50%;background:' + color + ';display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;font-weight:bold;border:2px solid #fff; box-shadow:0 2px 8px rgba(0,0,0,0.6);">' + initials + '</div></div>');
+  var pm = new ymaps.Placemark([emp.lat, emp.lon], {balloonContent: emp.name + '<br>' + emp.qual_name}, {iconLayout: empLayout, iconShape: {type: 'Rectangle', coordinates: [[-15, -15], [15, 15]]}, zIndex: 1000});
+  map.geoObjects.add(pm); markers['emp_' + emp.id] = pm;
+}
+
+function renderEmployees() { for (var emp of STATE.employees) updateEmpMarker(emp); }
+
+function drawRoute(fromLat, fromLon, toLat, toLon) {
+  if (!map) return;
+  if (routeLine) map.geoObjects.remove(routeLine);
+  routeLine = new ymaps.Polyline([[fromLat, fromLon], [toLat, toLon]], {}, { strokeColor: '#4a9eff', strokeWidth: 4, strokeStyle: 'dash' });
+  map.geoObjects.add(routeLine);
+}
+
+function initForms() {
+  var ss = document.getElementById('stand-select');
+  for (var pid in POINTS) {
+    if (pid.startsWith('stand')) { var opt = document.createElement('option'); opt.value = pid; opt.textContent = POINTS[pid].name; ss.appendChild(opt); }
+  }
+  var fs = document.getElementById('fault-select');
+  for (var fid in FAULTS) {
+    var opt2 = document.createElement('option'); opt2.value = fid; opt2.textContent = FAULTS[fid].name; fs.appendChild(opt2);
+  }
+}
+
+async function createRequest() {
+  var standId = document.getElementById('stand-select').value;
+  var board = document.getElementById('board-input').value;
+  var fault = document.getElementById('fault-select').value;
+  var res = await fetch('/api/create_request', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ stand_id: standId, board_number: board, fault_type: fault }) });
+  var req = await res.json();
+  currentRequestId = req.id;
+  renderCandidates(req.candidates, req.stand_id);
+}
+
+function renderCandidates(cands, standId) {
+  var list = document.getElementById('candidates-list');
+  list.innerHTML = '<div class="section-title">Рекомендации системы</div>';
+  if (!cands || cands.length === 0) { list.innerHTML += '<div class="empty">Нет свободных техников нужной квалификации</div>'; return; }
+  
+  const palette = ['#4caf50', '#4a9eff', '#9c27b0', '#ff9800', '#e91e63'];
+  
+  cands.forEach((c, i) => {
+    var bcolor = palette[i % palette.length];
+    var card = document.createElement('div'); card.className = 'candidate-card';
+    card.style.borderLeft = '4px solid ' + bcolor;
+    
+    card.onmouseover = function() {
+        var pt = POINTS[standId]; var emp = STATE.employees.find(e => e.id === c.emp_id);
+        if(emp && pt) drawRoute(emp.lat, emp.lon, pt.lat, pt.lon);
+    };
+    card.onmouseout = function() { if(routeLine && map) { map.geoObjects.remove(routeLine); routeLine = null; } };
+
+    card.innerHTML = '<div class="candidate-name">' + (i+1) + '. ' + c.name + '</div>' + 
+                     '<div class="candidate-info"><span class="eta-badge" style="background:'+bcolor+'">ETA ' + c.eta_min + ' мин | ' + c.distance_km + ' км</span>' + 
+                     '<span class="qual-badge" style="border-color:'+bcolor+'">' + c.qual_name + '</span></div>' + 
+                     '<button class="btn btn-green assign-btn" style="margin-top:8px;" onclick="assignEmployee(\\'' + c.emp_id + '\\')">Отправить наряд</button>';
+    list.appendChild(card);
+  });
+}
+
+async function assignEmployee(empId) {
+  await fetch('/api/assign', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ request_id: currentRequestId, employee_id: empId }) });
+  document.getElementById('candidates-list').innerHTML = '';
+  currentRequestId = null;
+  if(routeLine && map) { map.geoObjects.remove(routeLine); routeLine = null; }
+}
+
+function renderRequests() {
+  var list = document.getElementById('requests-list');
+  if (STATE.requests.length === 0) { list.innerHTML = '<div class="empty">Нет активных заявок</div>'; return; }
+  list.innerHTML = '';
+  for (var req of STATE.requests) {
+    if(req.status === 'completed') continue;
+    var card = document.createElement('div'); card.className = 'request-card';
+    let statColor = req.status === 'open' ? '#ff9800' : '#4a9eff';
+    card.innerHTML = '<div class="request-stand">' + req.stand_name + '</div><div class="request-board">Борт: ' + req.board_number + ' | ' + req.fault_name + '</div><div style="margin-top:8px;"><span style="font-size:11px; background:' + statColor + '; color:#fff; padding:4px 8px; border-radius:4px; font-weight:bold;">' + req.status.toUpperCase() + '</span></div>';
+    list.appendChild(card);
+  }
+}
+
+function renderLog() {
+  var list = document.getElementById('log-list'); list.innerHTML = '';
+  for (var e of STATE.events) {
+    var entry = document.createElement('div'); entry.className = 'log-entry';
+    entry.innerHTML = '<span class="time">' + e.time + '</span>' + e.msg;
+    list.appendChild(entry);
+  }
+}
+
+function renderStats() {
+  document.getElementById('stat-free').textContent = STATE.stats.free || 0;
+  document.getElementById('stat-enroute').textContent = STATE.stats.enroute || 0;
+  document.getElementById('stat-busy').textContent = STATE.stats.busy || 0;
+  document.getElementById('stat-total').textContent = STATE.stats.total || 0;
+}
+
+function renderTestEmps() {
+  var list = document.getElementById('test-emp-list'); list.innerHTML = '';
+  var colors = { free: '#4caf50', busy: '#f44336', enroute: '#4a9eff', assigned: '#ff9800' };
+  for (var emp of STATE.employees) {
+    var d = document.createElement('div'); d.style.cssText = 'padding:8px;border-bottom:1px solid var(--border);font-size:12px; display:flex; justify-content:space-between; align-items:center;';
+    var isPlayer = emp.name === 'Иванов И.И.' ? ' 🎮' : '';
+    d.innerHTML = '<span><b style="color:' + colors[emp.status] + '">●</b> ' + emp.name + isPlayer + '<br><span style="color:#8899aa;font-size:10px;">' + emp.qual_name + '</span></span> <span style="color:#667; font-weight:bold;">' + emp.status + '</span>';
+    list.appendChild(d);
+  }
+}
+
+async function runTest(n) { await fetch('/api/test/' + n); }
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).style.display = 'block';
+  });
+});
+
+ymaps.ready(initMap);
+initForms();
+</script>
+</body>
+</html>'''
+
+# ─── HTML ШАБЛОН ПРИЛОЖЕНИЯ СОТРУДНИКА (ИВАНОВ) ───
+EMPLOYEE_HTML = '''<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AeroDispatcher - Сотрудник</title>
+<script src="https://api-maps.yandex.ru/2.1/?lang=ru_RU&coordOrder=lat,long"></script>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f1923;--panel:#1a2735;--border:#2a3a4a;--text:#e0e8f0;--accent:#4a9eff;--green:#4caf50;--red:#f44336;--orange:#ff9800;--white:#ffffff}
+html,body{height:100%;overflow:hidden}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text)}
+.login-box{background:var(--panel);padding:30px;border-radius:12px;margin:80px auto 0;width:320px;border:1px solid var(--border)}
+.login-box h2{text-align:center;color:var(--accent);margin-bottom:20px}
+.login-box input{width:100%;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;margin-bottom:12px}
+.login-box button{width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer}
+.app{display:none;flex-direction:column;height:100vh;width:100%}
+.app-header{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0}
+.app-header h2{color:var(--accent);font-size:16px;font-weight:600}
+.status-badge{padding:5px 14px;border-radius:14px;font-size:12px;font-weight:600}
+.status-free{background:var(--green);color:#fff}
+.status-busy{background:var(--red);color:#fff}
+.status-enroute{background:var(--accent);color:#fff}
+.status-assigned{background:var(--orange);color:#fff}
+.map-wrap{flex:1;position:relative;overflow:hidden;background:var(--white)}
+#map{width:100%;height:100%;display:block}
+.route-banner{position:absolute;top:12px;left:12px;right:12px;background:var(--accent);color:#fff;padding:10px 16px;border-radius:8px;z-index:500;display:none;font-size:13px;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,0.3)}
+.route-banner .dest{font-size:15px}
+.route-banner .eta{float:right}
+.task-overlay{position:absolute;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--border);padding:16px 20px;z-index:500;display:none;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,0.5)}
+.task-overlay h3{font-size:14px;color:var(--accent);margin-bottom:10px}
+.info-row{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}
+.info-row span:first-child{color:#8899aa}
+.btn-group{display:flex;gap:8px;margin-top:12px}
+.btn{padding:12px 16px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;flex:1}
+.btn-accept{background:var(--green);color:#fff}
+.btn-reject{background:var(--red);color:#fff}
+.btn-complete{background:var(--accent);color:#fff}
+.bottom-bar{display:flex;gap:8px;padding:12px 20px;background:var(--panel);border-top:1px solid var(--border);flex-shrink:0}
+.bottom-bar .btn{flex:1}
+.btn-free{background:var(--green);color:#fff}
+.btn-busy{background:var(--orange);color:#fff}
+[class*="copyright"] { display: none !important; }
+[class*="gototech"] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="login-box" id="login-box">
+  <h2>✈ AeroDispatcher</h2>
+  <input type="text" id="login-name" placeholder="ФИО" value="Иванов И.И."/>
+  <input type="password" id="login-pass" placeholder="Пароль" value="1234"/>
+  <button onclick="doLogin()">Войти</button>
+</div>
+<div class="app" id="app">
+  <div class="app-header">
+    <h2 id="emp-name">✈ AeroDispatcher</h2>
+    <span class="status-badge status-free" id="emp-status-badge">Свободен</span>
+  </div>
+  <div class="map-wrap">
+    <div id="map"></div>
+    <div class="route-banner" id="route-banner">
+      <span class="dest" id="route-dest">Маршрут построен</span>
+      <span class="eta" id="route-eta"></span>
+    </div>
+    <div class="task-overlay" id="task-card">
+      <h3>🔧 Текущее задание</h3>
+      <div class="info-row"><span>Стоянка:</span><b id="task-stand">-</b></div>
+      <div class="info-row"><span>Бортовой номер:</span><b id="task-board">-</b></div>
+      <div class="info-row"><span>Неисправность:</span><b id="task-fault">-</b></div>
+      <div class="info-row"><span>ETA:</span><b id="task-eta">-</b></div>
+      <div style="margin-top:8px; padding:8px; background:rgba(74, 158, 255, 0.1); border-radius:6px; font-size:13px; color:#4a9eff; text-align:center; font-weight:bold; display:none;" id="task-state-msg"></div>
+      
+      <div class="btn-group" id="btn-accept-reject">
+        <button class="btn btn-accept" onclick="respondTask(true)">Принять</button>
+        <button class="btn btn-reject" onclick="respondTask(false)">Отклонить</button>
+      </div>
+      <div class="btn-group" id="btn-complete" style="display:none">
+        <button class="btn btn-complete" onclick="completeTask()">Завершить работу</button>
+      </div>
+    </div>
+  </div>
+  <div class="bottom-bar">
+    <button class="btn btn-busy" onclick="setStatus('busy')">На обслуживании</button>
+    <button class="btn btn-free" onclick="setStatus('free')">Свободен</button>
+  </div>
+</div>
+<script>
+const POINTS = {{ points_json | safe }};
+var myEmpId = null; var currentAssignmentId = null;
+var myLat = 51.7905; var myLon = 55.4640;
+var map = null; var myMarker = null; var destMarker = null; var routeLine = null;
+var socket = io();
+
+socket.on('connect', function() { socket.emit('request_state'); });
+socket.on('state_update', function(data) {
+  if (!myEmpId) return;
+  var me = data.employees.find(e => e.id === myEmpId);
+  if (me) {
+    updateStatusBadge(me.status); myLat = me.lat; myLon = me.lon;
+    if (map && myMarker) myMarker.geometry.setCoordinates([myLat, myLon]);
+    
+    var myAsgns = data.assignments.filter(a => a.employee_id === myEmpId && a.status !== 'completed' && a.status !== 'rejected');
+    if (myAsgns.length > 0) {
+      var active = myAsgns[0];
+      currentAssignmentId = active.id;
+      
+      document.getElementById('task-card').style.display = 'block';
+      document.getElementById('task-stand').textContent = active.stand_name;
+      document.getElementById('task-board').textContent = active.board_number;
+      document.getElementById('task-fault').textContent = active.fault_name;
+      document.getElementById('task-eta').textContent = active.eta_min + ' мин';
+      
+      var msgEl = document.getElementById('task-state-msg');
+      msgEl.style.display = 'block';
+
+      if (active.status === 'assigned') {
+          document.getElementById('btn-accept-reject').style.display = 'flex';
+          document.getElementById('btn-complete').style.display = 'none';
+          msgEl.textContent = "Ожидает вашего подтверждения";
+      } else if (active.status === 'accepted') {
+          document.getElementById('btn-accept-reject').style.display = 'none';
+          if (me.status === 'enroute') {
+              document.getElementById('btn-complete').style.display = 'none';
+              msgEl.textContent = "Вы в пути к воздушному судну...";
+          } else if (me.status === 'busy') {
+              document.getElementById('btn-complete').style.display = 'flex';
+              msgEl.textContent = "Вы на месте. Завершите работу по готовности.";
+          }
+      }
+      buildRoute(active.stand_id, active.stand_name, active.eta_min);
+    } else {
+      document.getElementById('task-card').style.display = 'none';
+      clearRoute();
+      currentAssignmentId = null;
+    }
+  }
+});
+
+socket.on('employee_moved', function(data) {
+    if(data.id === myEmpId && map && myMarker) {
+        myLat = data.lat; myLon = data.lon;
+        myMarker.geometry.setCoordinates([myLat, myLon]);
+    }
+});
+
+function initMap() {
+  map = new ymaps.Map('map', { center: [51.7915, 55.4580], zoom: 16, type: 'yandex#satellite', controls: ['zoomControl'] });
+  for (var pid in POINTS) {
+    var pt = POINTS[pid];
+    var isATB = pid === 'atb'; var isTruck = pid.indexOf('truck') === 0; var isTerminal = pid === 'terminal'; var isDisp = pid === 'disp';
+    var isTaxi = pid.startsWith('taxi') || pid.startsWith('bld');
+    var svgIcon = '';
+    if(isATB) svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="16" height="16"><path d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.5 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.8.8 2.1.8 2.8 0l.9-.9c.8-.8.8-2.1.1-2.8z"/></svg>';
+    else if(isTruck) svgIcon = '<svg fill="#000" viewBox="0 0 24 24" width="16" height="16"><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm13.5-9l1.96 2.5H17V9.5h2.5zm-1.5 9c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>';
+    else if(isTerminal) svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="16" height="16"><path d="M12 2L2 22h20L12 2zm0 3.8l6.2 14.2H5.8L12 5.8zM11 10v4h2v-4h-2zm0 5v2h2v-2h-2z"/></svg>';
+    else if(isDisp || isTaxi) svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="8"/></svg>';
+    else svgIcon = '<svg fill="#fff" viewBox="0 0 24 24" width="18" height="18"><path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>';
+    var bgColor = isATB ? '#ff9800' : isTruck ? '#ffd700' : isTerminal ? '#4caf50' : (isDisp || isTaxi) ? '#9c27b0' : '#4a9eff';
+    var ptLayout = ymaps.templateLayoutFactory.createClass('<div style="display:flex;flex-direction:column;align-items:center;"><div style="width:28px;height:28px;border-radius:50%;background:' + bgColor + ';display:flex;align-items:center;justify-content:center;border:2px solid #fff;">' + svgIcon + '</div></div>');
+    map.geoObjects.add(new ymaps.Placemark([pt.lat, pt.lon], {balloonContent: pt.name}, {iconLayout: ptLayout, iconShape: {type: 'Rectangle', coordinates: [[-20, -20], [20, 20]]}}));
+  }
+  var myLayout = ymaps.templateLayoutFactory.createClass('<div style="display:flex;flex-direction:column;align-items:center;"><div style="width:24px;height:24px;border-radius:50%;background:#4caf50;display:flex;align-items:center;justify-content:center;font-size:12px;border:3px solid #fff; box-shadow:0 0 10px #000;">📍</div></div>');
+  myMarker = new ymaps.Placemark([myLat, myLon], {}, {iconLayout: myLayout, iconShape: {type: 'Rectangle', coordinates: [[-15, -15], [15, 15]]}, zIndex: 1000});
+  map.geoObjects.add(myMarker);
+}
+
+function buildRoute(standId, standName, etaMin) {
+  if (!map) return;
+  var pt = POINTS[standId];
+  if (!pt) return;
+  if (routeLine) { map.geoObjects.remove(routeLine); routeLine = null; }
+  if (destMarker) { map.geoObjects.remove(destMarker); destMarker = null; }
+  
+  var destLayout = ymaps.templateLayoutFactory.createClass('<div style="display:flex;flex-direction:column;align-items:center;"><div style="width:30px;height:30px;border-radius:50%;background:#f44336;display:flex;align-items:center;justify-content:center;font-size:14px;border:3px solid #fff;">🎯</div></div>');
+  destMarker = new ymaps.Placemark([pt.lat, pt.lon], {balloonContent: standName}, {iconLayout: destLayout, iconShape: {type: 'Rectangle', coordinates: [[-20, -20], [20, 20]]}, zIndex: 1000});
+  map.geoObjects.add(destMarker);
+  
+  routeLine = new ymaps.Polyline([[myLat, myLon], [pt.lat, pt.lon]], {}, {strokeColor: '#4a9eff', strokeWidth: 4, strokeStyle: 'solid'});
+  map.geoObjects.add(routeLine);
+  
+  document.getElementById('route-dest').textContent = 'Маршрут: ' + standName;
+  document.getElementById('route-eta').textContent = 'ETA ' + etaMin + ' мин';
+  document.getElementById('route-banner').style.display = 'block';
+}
+
+function clearRoute() {
+  if (!map) return;
+  if (routeLine) { map.geoObjects.remove(routeLine); routeLine = null; }
+  if (destMarker) { map.geoObjects.remove(destMarker); destMarker = null; }
+  document.getElementById('route-banner').style.display = 'none';
+}
+
+async function doLogin() {
+  var name = document.getElementById('login-name').value.trim(); var pass = document.getElementById('login-pass').value;
+  if (!name) return;
+  var res = await fetch('/api/android/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name: name, password: pass }) });
+  var data = await res.json();
+  if (data.status === 'ok') {
+    myEmpId = data.employee_id;
+    document.getElementById('login-box').style.display = 'none'; document.getElementById('app').style.display = 'flex';
+    document.getElementById('emp-name').textContent = name; ymaps.ready(initMap);
+  }
+}
+
+function updateStatusBadge(status) {
+  var badge = document.getElementById('emp-status-badge'); badge.className = 'status-badge status-' + status;
+  badge.textContent = { free: 'Свободен', busy: 'Занят', enroute: 'В пути', assigned: 'Ожидает' }[status] || status;
+}
+
+async function setStatus(status) {
+  if (!myEmpId) return;
+  await fetch('/api/android/status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ employee_id: myEmpId, status: status }) });
+}
+
+async function respondTask(accepted) {
+  if (!myEmpId || !currentAssignmentId) return;
+  await fetch('/api/android/assignment_respond', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ employee_id: myEmpId, assignment_id: currentAssignmentId, accepted: accepted }) });
+}
+
+async function completeTask() {
+  if (!myEmpId) return;
+  await setStatus('return_to_base'); 
+}
+</script>
+</body>
+</html>'''
+
+SIMULATION_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Симуляция аэропорта</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #3f4e45; font-family: sans-serif; user-select: none; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        #instruction { position: absolute; background: rgba(15, 23, 42, 0.95); color: #e2e8f0; padding: 22px; border-radius: 12px; pointer-events: auto; width: 190px; font-size: 1.15rem; border: 1px solid rgba(255,255,255,0.05); box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); backdrop-filter: blur(4px); margin: 0; line-height: 1.5; }
+        #log-panel { position: absolute; bottom: 20px; right: 20px; width: 400px; height: 200px; background: rgba(15, 23, 42, 0.95); color: #e2e8f0; border-radius: 8px; padding: 16px; overflow-y: auto; pointer-events: auto; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; backdrop-filter: blur(4px); }
+        .log-entry { margin-bottom: 8px; font-size: 0.85rem; line-height: 1.4; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 4px; }
+        .log-time { color: #94a3b8; font-size: 0.75rem; margin-right: 6px; }
+        #tooltip { position: absolute; background: rgba(255, 255, 255, 0.95); color: #1e293b; padding: 12px; border-radius: 8px; font-size: 0.85rem; pointer-events: none; opacity: 0; transform: translate(-50%, -120%); transition: opacity 0.15s ease; border: 1px solid #cbd5e1; z-index: 10; min-width: 150px; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: bold; margin-top: 6px; }
+        .bg-free { background-color: #dcfce7; color: #166534; } .bg-busy { background-color: #fee2e2; color: #991b1b; } .bg-wait { background-color: #fef08a; color: #854d0e; }
+        #defect-modal, #proposal-modal { position: absolute; background: rgba(30, 41, 59, 0.98); border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; padding: 16px; width: 260px; pointer-events: auto; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.7); transform: translate(-50%, -50%); z-index: 20; }
+        #proposal-modal { border-color: #3b82f6; z-index: 30; }
+        .defect-btn { display: block; width: 100%; text-align: left; padding: 8px 12px; margin-bottom: 6px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; color: white; font-size: 0.85rem; cursor: pointer; transition: background 0.2s; }
+        .defect-btn:hover { background: rgba(239, 68, 68, 0.2); border-color: rgba(239, 68, 68, 0.5); }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+    <div id="ui-layer">
+        <div id="instruction">
+            <h2 class="font-bold text-3xl mb-4 text-blue-400">Аэропорт</h2>
+            <p class="mb-4">Кликните по <b>припаркованному</b> самолету для имитации поломки.</p>
+            <p class="mb-1 text-slate-300">Курсор на техников покажет их статус.</p>
+        </div>
+        <div id="log-panel"></div>
+        <div id="tooltip">
+            <div class="font-bold text-base border-b border-slate-300 pb-1 mb-1" id="tt-name">Техник</div>
+            <div class="text-sm text-slate-700 mb-1" id="tt-spec">Специализация: Двигатели</div>
+            <div class="text-sm">Квалификация: <span id="tt-skill" class="font-bold text-blue-600">5</span> ⭐️</div>
+            <div class="badge" id="tt-status">Свободен</div>
+        </div>
+        <div id="defect-modal" class="hidden">
+            <div class="text-white font-bold mb-3 border-b border-slate-600 pb-2">Выберите поломку:</div>
+            <div id="defect-buttons"></div>
+            <button onclick="closeDefectModal()" class="mt-3 w-full py-2 text-center text-xs bg-slate-700 text-slate-300 rounded hover:bg-slate-600 hover:text-white transition">Отмена</button>
+        </div>
+        <div id="proposal-modal" class="hidden">
+            <div class="text-white font-bold mb-3 border-b border-blue-500 pb-2">Предложение диспетчеру:</div>
+            <div id="proposal-list"></div>
+            <button onclick="cancelProposal()" class="mt-3 w-full py-2 text-center text-xs bg-slate-700 text-slate-300 rounded hover:bg-slate-600 hover:text-white transition">Отложить (в очередь)</button>
+        </div>
+    </div>
+    <script>
+        const canvas = document.getElementById('gameCanvas'); const ctx = canvas.getContext('2d');
+        const tooltip = document.getElementById('tooltip'); const logPanel = document.getElementById('log-panel');
+        const defectModal = document.getElementById('defect-modal'); const defectButtonsContainer = document.getElementById('defect-buttons');
+        const proposalModal = document.getElementById('proposal-modal'); const proposalList = document.getElementById('proposal-list');
+        const instructionPanel = document.getElementById('instruction');
+        const VIRTUAL_WIDTH = 1920; const VIRTUAL_HEIGHT = 1080;
+        let scale = 1; let offsetX = 0; let offsetY = 0;
+        let gameTimeSeconds = 8 * 3600;
+        const SPECIALTIES = ['Двигатели', 'Электроника', 'Шасси', 'Гидравлика'];
+        const MECHANIC_NAMES = ['Иванов', 'Петров', 'Смирнов', 'Кузнецов', 'Соколов', 'Попов', 'Лебедев', 'Морозов', 'Волков', 'Зайцев', 'Новиков', 'Федоров', 'Алексеев'];
+        let mouseX = 0; let mouseY = 0; let selectedPlaneForDefect = null; let currentProposal = null; 
+        SPECIALTIES.forEach(spec => {
+            const btn = document.createElement('button'); btn.className = 'defect-btn'; btn.innerText = `⚠️ Отказ: ${spec}`; btn.onclick = () => confirmDefect(spec); defectButtonsContainer.appendChild(btn);
+        });
+        const MAP = {
+            runway: { x: 0, y: 940, w: 1920, h: 80 },
+            taxiways: [ { id: 'left', x: 200, y: 520, w: 40, h: 420 }, { id: 'right', x: 1350, y: 520, w: 40, h: 420 }, { id: 'central', x: 200, y: 520, w: 1190, h: 40 } ],
+            apron: { x: 200, y: 250, w: 1190, h: 570 },
+            terminal: { x: 200, y: 40, w: 900, h: 180 },
+            techBase: { x: 1450, y: 60, w: 350, h: 220 },
+            topMaint: { x: 10, y: 250, w: 180, h: 200 }, 
+            bottomMaint: { x: 380, y: 820, w: 600, h: 80 },
+            tower: { x: 1300, y: 200 }, parkingSpots: []
+        };
+        const startX = 350; const spacingX = 180;
+        for(let i=0; i<5; i++) { MAP.parkingSpots.push({ id: i+1, x: startX + (i * spacingX), y: 360, type: 'top', occupiedBy: null }); }
+        for(let i=0; i<5; i++) { MAP.parkingSpots.push({ id: i+6, x: startX + (i * spacingX), y: 680, type: 'bottom', occupiedBy: null }); }
+
+        function getRandomAirportTarget() {
+            const zones = [ MAP.techBase, MAP.techBase, MAP.techBase, MAP.techBase, MAP.terminal, MAP.terminal, MAP.terminal, MAP.topMaint, MAP.topMaint, MAP.bottomMaint, MAP.bottomMaint ];
+            let z = zones[Math.floor(Math.random() * zones.length)];
+            return { x: z.x + 10 + Math.random() * (z.w - 20), y: z.y + 10 + Math.random() * (z.h - 20) };
+        }
+
+        const planes = []; const mechanics = []; const serviceVehicles = []; const pendingFaults = [];
+        const TARGET_CONCURRENT_PLANES = 5; let planeIdCounter = 100; const dispatcher = { alert: false, blinkTimer: 0 };
+
+        function getFormattedGameTime() {
+            let h = Math.floor(gameTimeSeconds / 3600) % 24; let m = Math.floor((gameTimeSeconds % 3600) / 60); let s = Math.floor(gameTimeSeconds % 60);
+            return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        }
+        function addLog(message) {
+            const timeStr = getFormattedGameTime(); const entry = document.createElement('div'); entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">[${timeStr}]</span> ${message}`; logPanel.prepend(entry);
+            if (logPanel.children.length > 30) logPanel.removeChild(logPanel.lastChild);
+        }
+        function resize() {
+            canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+            const scaleX = canvas.width / VIRTUAL_WIDTH; const scaleY = canvas.height / VIRTUAL_HEIGHT; scale = Math.min(scaleX, scaleY);
+            offsetX = (canvas.width - VIRTUAL_WIDTH * scale) / 2; offsetY = (canvas.height - VIRTUAL_HEIGHT * scale) / 2;
+            instructionPanel.style.left = (offsetX + 5 * scale) + 'px'; instructionPanel.style.top = (offsetY + 480 * scale) + 'px'; 
+            instructionPanel.style.transform = `scale(${scale})`; instructionPanel.style.transformOrigin = 'top left';
+        }
+        window.addEventListener('resize', resize); resize();
+
+        class Mechanic {
+            constructor() {
+                this.name = MECHANIC_NAMES[Math.floor(Math.random() * MECHANIC_NAMES.length)];
+                this.specialty = SPECIALTIES[Math.floor(Math.random() * SPECIALTIES.length)];
+                this.skill = Math.floor(Math.random() * 5) + 1; 
+                this.state = 'Свободен'; this.isWaitingForPlane = false;
+                let t = getRandomAirportTarget(); this.x = t.x; this.y = t.y; this.targetX = this.x; this.targetY = this.y;
+                this.speed = 40; this.assignedPlane = null; this.timer = 0; this.idleTimer = 20 + Math.random() * 40; 
+            }
+            update(dt) {
+                let shouldWait = false;
+                this.speed = 40;
+                for (let p of planes) {
+                    let distToPlane = Math.hypot(p.x - this.x, p.y - this.y);
+                    if (distToPlane < 130 && ['РУЛЕНИЕ', 'ПОСАДКА', 'РУЛЕНИЕ_ВЗЛЕТ'].includes(p.state)) {
+                        if (this.y > 470 && this.y < 610) { this.speed = 140; } else { shouldWait = true; }
+                    }
+                    if (p.state !== 'УЛЕТЕЛ' && distToPlane < 60 && this.state === 'Свободен') {
+                        let t = getRandomAirportTarget(); this.targetX = t.x; this.targetY = t.y; this.idleTimer = 0;
+                    }
+                }
+                this.isWaitingForPlane = shouldWait;
+                if (!this.isWaitingForPlane) {
+                    if (this.x !== this.targetX || this.y !== this.targetY) {
+                        const dx = this.targetX - this.x; const dy = this.targetY - this.y; const dist = Math.hypot(dx, dy); const move = this.speed * dt;
+                        if (dist < move) { this.x = this.targetX; this.y = this.targetY; } else { this.x += (dx / dist) * move; this.y += (dy / dist) * move; }
+                    }
+                    if (this.state === 'Свободен') {
+                        if (this.x === this.targetX && this.y === this.targetY) {
+                            this.idleTimer -= dt;
+                            if (this.idleTimer <= 0) { let t = getRandomAirportTarget(); this.targetX = t.x; this.targetY = t.y; this.idleTimer = 20 + Math.random() * 40; }
+                        }
+                    } else if (this.state === 'Идет к ВС') {
+                        if (this.x === this.targetX && this.y === this.targetY) {
+                            this.state = 'Чинит'; this.timer = 8 + Math.random() * 5; addLog(`<b>${this.name}</b> начал ремонт [${this.specialty}] борта ${this.assignedPlane.id}`);
+                        }
+                    } else if (this.state === 'Чинит') {
+                        this.timer -= dt;
+                        if (this.timer <= 0) {
+                            addLog(`Поломка борта ${this.assignedPlane.id} устранена!`);
+                            this.assignedPlane.broken = false; this.state = 'Возвращается'; let t = getRandomAirportTarget(); this.targetX = t.x; this.targetY = t.y; this.assignedPlane = null; checkPendingFaults();
+                        }
+                    } else if (this.state === 'Возвращается') {
+                        if (this.x === this.targetX && this.y === this.targetY) { this.state = 'Свободен'; checkPendingFaults(); }
+                    }
+                }
+            }
+            draw(ctx) {
+                ctx.beginPath(); ctx.arc(this.x, this.y, 6, 0, Math.PI * 2);
+                if (this.isWaitingForPlane) ctx.fillStyle = '#facc15'; else if (this.state === 'Свободен') ctx.fillStyle = '#4ade80'; else ctx.fillStyle = '#ef4444';
+                ctx.fill(); ctx.strokeStyle = '#0f172a'; ctx.lineWidth = 1; ctx.stroke();
+            }
+        }
+
+        class ServiceVehicle {
+            constructor(plane, type, index) {
+                this.plane = plane; this.type = type; this.isTop = plane.targetSpot.type === 'top';
+                this.spawnX = this.isTop ? MAP.topMaint.x + MAP.topMaint.w - 10 : MAP.bottomMaint.x + MAP.bottomMaint.w/2;
+                this.spawnY = this.isTop ? MAP.topMaint.y + MAP.topMaint.h/2 : MAP.bottomMaint.y + 10;
+                this.laneY = this.isTop ? 280 : 760; this.x = this.spawnX; this.y = this.spawnY;
+                let xOffset = 0, yOffset = 0;
+                if (type === 'stairs') { xOffset = this.isTop ? -25 : 25; yOffset = this.isTop ? -10 : 10; }
+                else if (type === 'baggage') { xOffset = this.isTop ? 25 : -25; yOffset = this.isTop ? 20 : -20; }
+                else if (type === 'fuel') { xOffset = this.isTop ? 35 : -35; yOffset = 0; }
+                this.targetX = plane.targetSpot.x + xOffset; this.targetY = plane.targetSpot.y + yOffset;
+                this.waypoints = [ {x: this.spawnX, y: this.laneY}, {x: this.targetX, y: this.laneY}, {x: this.targetX, y: this.targetY} ];
+                this.rotation = 0; this.startDelay = index * 0.7; this.state = 'ЖДЕТ_ОЧЕРЕДИ'; this.speed = 130; this.timer = 10 + Math.random() * 5; 
+            }
+            update(dt) {
+                if (this.state === 'ЖДЕТ_ОЧЕРЕДИ') { this.startDelay -= dt; if (this.startDelay <= 0) this.state = 'ЕДЕТ_К_ВС'; return; }
+                if (this.state === 'ЕДЕТ_К_ВС' || this.state === 'ВОЗВРАЩАЕТСЯ') {
+                    if (this.waypoints.length > 0) {
+                        let wp = this.waypoints[0]; let dx = wp.x - this.x; let dy = wp.y - this.y; let dist = Math.hypot(dx, dy); let move = this.speed * dt;
+                        if (dist < move) {
+                            this.x = wp.x; this.y = wp.y; this.waypoints.shift();
+                            if (this.waypoints.length === 0) { if (this.state === 'ЕДЕТ_К_ВС') { this.state = 'ОБСЛУЖИВАЕТ'; this.rotation = this.isTop ? -Math.PI/2 : Math.PI/2; } else { this.state = 'ГОТОВО'; } }
+                        } else {
+                            this.x += (dx / dist) * move; this.y += (dy / dist) * move;
+                            let targetAngle = Math.atan2(dy, dx) + Math.PI/2; let diff = targetAngle - this.rotation;
+                            while (diff < -Math.PI) diff += Math.PI * 2; while (diff > Math.PI) diff -= Math.PI * 2; this.rotation += diff * 0.15;
+                        }
+                    }
+                } else if (this.state === 'ОБСЛУЖИВАЕТ') {
+                    this.timer -= dt;
+                    if (this.timer <= 0) { this.state = 'ВОЗВРАЩАЕТСЯ'; this.waypoints = [ {x: this.x, y: this.laneY}, {x: this.spawnX, y: this.laneY}, {x: this.spawnX, y: this.spawnY} ]; }
+                }
+            }
+            draw(ctx) {
+                ctx.save(); ctx.translate(this.x, this.y); ctx.rotate(this.rotation);
+                if (this.type === 'stairs') {
+                    ctx.fillStyle = '#94a3b8'; ctx.fillRect(-8, -14, 16, 12); ctx.fillStyle = '#475569'; ctx.fillRect(-8, -2, 16, 20); ctx.fillStyle = '#cbd5e1'; ctx.fillRect(-20, 0, 12, 16); 
+                    ctx.strokeStyle = '#64748b'; ctx.beginPath(); for(let i=2; i<16; i+=3) { ctx.moveTo(-20, i); ctx.lineTo(-8, i); } ctx.stroke();
+                } else if (this.type === 'baggage') {
+                    ctx.fillStyle = '#3b82f6'; ctx.fillRect(-7, -14, 14, 10); ctx.fillStyle = '#334155'; ctx.fillRect(-8, -4, 16, 22); ctx.fillStyle = '#a855f7'; ctx.fillRect(-5, 0, 8, 6); 
+                    ctx.fillStyle = '#ec4899'; ctx.fillRect(-2, 8, 6, 8); ctx.fillStyle = '#10b981'; ctx.fillRect(2, 2, 5, 6);
+                } else if (this.type === 'fuel') {
+                    ctx.fillStyle = '#dc2626'; ctx.fillRect(-8, -16, 16, 12); ctx.fillStyle = '#94a3b8'; ctx.fillRect(-10, -4, 20, 24); ctx.fillStyle = '#cbd5e1'; ctx.fillRect(-6, -2, 12, 20); 
+                }
+                if (this.state !== 'ГОТОВО' && this.state !== 'ЖДЕТ_ОЧЕРЕДИ' && Date.now() % 600 < 300) { ctx.fillStyle = '#ef4444'; ctx.beginPath(); ctx.arc(0, -10, 3, 0, Math.PI*2); ctx.fill(); ctx.fillStyle = 'rgba(239, 68, 68, 0.4)'; ctx.beginPath(); ctx.arc(0, -10, 10, 0, Math.PI*2); ctx.fill(); }
+                ctx.restore();
+            }
+        }
+
+        class Plane {
+            constructor() {
+                this.id = "SU-" + (planeIdCounter++); this.x = -200; this.y = MAP.runway.y + 40; this.angle = 0; this.state = 'ПОДЛЕТ'; this.speed = 300; this.targetSpot = null; this.broken = false;
+                this.parkTimer = 15 + Math.random() * 20; this.waypoints = []; this.color = `hsl(${Math.random() * 360}, 70%, 50%)`; this.vehiclesSpawned = false;
+                addLog(`Рейс ${this.id} запрашивает посадку.`);
+            }
+            assignSpot(spot) {
+                this.targetSpot = spot; spot.occupiedBy = this;
+                this.waypoints = [ { x: MAP.taxiways[0].x + 20, y: MAP.runway.y + 40, rev: false }, { x: MAP.taxiways[0].x + 20, y: MAP.taxiways[2].y + 20, rev: false }, { x: spot.x, y: MAP.taxiways[2].y + 20, rev: false }, { x: spot.x, y: spot.y, rev: false } ];
+            }
+            checkCollision() {
+                if (this.waypoints.length === 0) return false;
+                let wp = this.waypoints[0]; let moveAngle = Math.atan2(wp.y - this.y, wp.x - this.x); if (wp.rev) moveAngle += Math.PI;
+                let myDistToCenter = Math.abs(this.y - 540); let iAmOnTaxiway = myDistToCenter < 70; 
+                if (this.state === 'РУЛЕНИЕ_ВЗЛЕТ' && wp.rev) {
+                    for (let other of planes) {
+                        if (other === this || other.state === 'ПРИПАРКОВАН' || other.state === 'УЛЕТЕЛ') continue;
+                        if (other.state === 'РУЛЕНИЕ_ВЗЛЕТ' && other.waypoints[0]?.rev) { if (Math.abs(this.x - other.x) < 10) { if (this.y > other.y) return true; } else if (this.x < other.x) { return true; } }
+                    }
+                }
+                if (this.state === 'РУЛЕНИЕ_ВЗЛЕТ' && wp.rev && !iAmOnTaxiway) {
+                    for (let other of planes) {
+                        if (other === this || other.state === 'ПРИПАРКОВАН' || other.state === 'УЛЕТЕЛ') continue;
+                        let isMovingOnTaxiway = (other.state === 'РУЛЕНИЕ' || other.state === 'ПОСАДКА' || (other.state === 'РУЛЕНИЕ_ВЗЛЕТ' && !other.waypoints[0]?.rev));
+                        if (isMovingOnTaxiway) { if (other.y > 480 && other.y < 600) { if (other.x > this.x - 180 && other.x < this.x + 80) { return true; } } }
+                    }
+                }
+                for (let other of planes) {
+                    if (other === this || other.state === 'ПРИПАРКОВАН' || other.state === 'УЛЕТЕЛ' || other.state === 'ПОДЛЕТ') continue;
+                    if (!wp.rev && other.state === 'РУЛЕНИЕ_ВЗЛЕТ' && other.waypoints.length > 0 && other.waypoints[0].rev) { let otherDistToCenter = Math.abs(other.y - 540); let otherIsOnTaxiway = otherDistToCenter < 70; if (!otherIsOnTaxiway) continue; }
+                    let dx = other.x - this.x; let dy = other.y - this.y; let dist = Math.hypot(dx, dy);
+                    if (dist < 120) { let angleToOther = Math.atan2(dy, dx); let angleDiff = Math.abs(moveAngle - angleToOther); angleDiff = Math.atan2(Math.sin(angleDiff), Math.cos(angleDiff)); if (Math.abs(angleDiff) < Math.PI / 2.5) { return true; } }
+                }
+                return false;
+            }
+            update(dt) {
+                if (this.state === 'ПРИПАРКОВАН') {
+                    if (!this.vehiclesSpawned) { serviceVehicles.push(new ServiceVehicle(this, 'stairs', 0)); serviceVehicles.push(new ServiceVehicle(this, 'baggage', 1)); serviceVehicles.push(new ServiceVehicle(this, 'fuel', 2)); this.vehiclesSpawned = true; }
+                    if (!this.broken) {
+                        this.parkTimer -= dt; let myVehicles = serviceVehicles.filter(v => v.plane === this && v.state !== 'ГОТОВО');
+                        if (this.parkTimer <= 0 && myVehicles.length === 0) {
+                            this.state = 'РУЛЕНИЕ_ВЗЛЕТ'; addLog(`Рейс ${this.id} выталкивается для взлета.`);
+                            this.waypoints = [ { x: this.targetSpot.x, y: MAP.taxiways[2].y + 20, rev: true }, { x: MAP.taxiways[1].x + 20, y: MAP.taxiways[2].y + 20, rev: false }, { x: MAP.taxiways[1].x + 20, y: MAP.runway.y + 40, rev: false }, { x: 2100, y: MAP.runway.y + 40, rev: false } ];
+                        }
+                    }
+                    return; 
+                }
+                if (this.waypoints.length > 0) {
+                    let currentSpeed = this.speed;
+                    if (this.state !== 'ВЗЛЕТ' && this.state !== 'ПОДЛЕТ' && this.checkCollision()) { currentSpeed = 0; }
+                    const wp = this.waypoints[0]; const dx = wp.x - this.x; const dy = wp.y - this.y; const dist = Math.hypot(dx, dy);
+                    let targetAngle = Math.atan2(dy, dx); if (wp.rev) targetAngle += Math.PI; 
+                    if (this.state === 'ПОСАДКА') currentSpeed = Math.max(70, 300 - (this.x / 400) * 200); 
+                    if (this.state === 'РУЛЕНИЕ' || this.state === 'РУЛЕНИЕ_ВЗЛЕТ') { currentSpeed = currentSpeed > 0 ? (wp.rev ? 40 : 80) : 0; }
+                    if (this.state === 'ВЗЛЕТ') currentSpeed = Math.max(100, 100 + ((this.x - MAP.taxiways[1].x) / 500) * 350); 
+                    const move = currentSpeed * dt;
+                    if (dist <= move) {
+                        this.x = wp.x; this.y = wp.y; this.waypoints.shift();
+                        if (this.state === 'РУЛЕНИЕ_ВЗЛЕТ' && this.targetSpot && !this.waypoints[0]?.rev) { this.targetSpot.occupiedBy = null; this.targetSpot = null; }
+                        if (this.waypoints.length === 0) {
+                            if (this.state === 'ПОСАДКА' || this.state === 'РУЛЕНИЕ') { this.state = 'ПРИПАРКОВАН'; this.angle = this.targetSpot.type === 'top' ? -Math.PI/2 : Math.PI/2; addLog(`Рейс ${this.id} припаркован на месте ${this.targetSpot.id}.`); } else if (this.state === 'РУЛЕНИЕ_ВЗЛЕТ' || this.state === 'ВЗЛЕТ') { this.state = 'УЛЕТЕЛ'; }
+                        } else if (this.state === 'ПОДЛЕТ') { this.state = 'ПОСАДКА'; } else if (this.state === 'ПОСАДКА' && this.waypoints.length === 2) { this.state = 'РУЛЕНИЕ'; } else if (this.state === 'РУЛЕНИЕ_ВЗЛЕТ' && wp.y === MAP.runway.y + 40) { this.state = 'ВЗЛЕТ'; addLog(`Рейс ${this.id} разгоняется и взлетает.`); }
+                    } else if (currentSpeed > 0) {
+                        let diff = targetAngle - this.angle; while (diff < -Math.PI) diff += Math.PI * 2; while (diff > Math.PI) diff -= Math.PI * 2;
+                        if (!wp.rev) { this.angle += diff * 0.1; }
+                        let moveVec = Math.atan2(dy, dx); this.x += Math.cos(moveVec) * move; this.y += Math.sin(moveVec) * move;
+                    }
+                }
+            }
+            draw(ctx) {
+                ctx.save(); ctx.translate(this.x, this.y); ctx.rotate(this.angle);
+                ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.beginPath(); ctx.moveTo(35, 15); ctx.lineTo(-25, 25); ctx.lineTo(-25, 0); ctx.fill();
+                ctx.fillStyle = '#f1f5f9'; ctx.beginPath(); ctx.moveTo(20, 0); ctx.lineTo(0, 40); ctx.lineTo(-15, 40); ctx.lineTo(5, 0); ctx.lineTo(-15, -40); ctx.lineTo(0, -40); ctx.lineTo(20, 0); ctx.closePath(); ctx.fill();
+                ctx.fillStyle = this.color; ctx.beginPath(); ctx.moveTo(-15, 0); ctx.lineTo(-30, 16); ctx.lineTo(-35, 16); ctx.lineTo(-25, 0); ctx.lineTo(-35, -16); ctx.lineTo(-30, -16); ctx.closePath(); ctx.fill();
+                ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.moveTo(30, 0); ctx.quadraticCurveTo(30, 9, 10, 9); ctx.lineTo(-30, 7); ctx.quadraticCurveTo(-35, 0, -30, -7); ctx.lineTo(10, -9); ctx.quadraticCurveTo(30, -9, 30, 0); ctx.fill();
+                ctx.fillStyle = '#38bdf8'; ctx.beginPath(); ctx.arc(24, 0, 2.5, 0, Math.PI*2); ctx.fill();
+                if (this.broken) { ctx.fillStyle = 'rgba(239, 68, 68, 0.4)'; ctx.beginPath(); ctx.arc(0, 0, 25 + Math.sin(Date.now()/150)*5, 0, Math.PI*2); ctx.fill(); }
+                ctx.restore();
+            }
+        }
+
+        for (let i = 0; i < 20; i++) mechanics.push(new Mechanic());
+
+        function findProposedMechanics(plane, faultSpec) {
+            let available = mechanics.filter(m => m.state === 'Свободен' && m.specialty === faultSpec);
+            if (available.length === 0) return [];
+            available.sort((a, b) => { if (b.skill !== a.skill) { return b.skill - a.skill; } let distA = Math.hypot(a.x - plane.x, a.y - plane.y); let distB = Math.hypot(b.x - plane.x, b.y - plane.y); return distA - distB; });
+            return available.slice(0, 2); 
+        }
+
+        function checkPendingFaults() {
+            if (pendingFaults.length > 0 && !currentProposal) {
+                const task = pendingFaults[0]; let candidates = findProposedMechanics(task.plane, task.fault);
+                if (candidates.length > 0) { pendingFaults.shift(); showProposal(task.plane, task.fault, candidates); }
+            }
+        }
+
+        window.addEventListener('pointerdown', (e) => {
+            if (e.target.closest('#defect-modal') || e.target.closest('#instruction') || e.target.closest('#log-panel') || e.target.closest('#proposal-modal')) return;
+            const mx = (e.clientX - offsetX) / scale; const my = (e.clientY - offsetY) / scale;
+            closeDefectModal();
+            for (let p of planes) {
+                if (p.state === 'ПРИПАРКОВАН' && !p.broken && !currentProposal) {
+                    if (Math.hypot(p.x - mx, p.y - my) < 50) { openDefectModal(p, e.clientX, e.clientY); break; }
+                }
+            }
+        });
+
+        function openDefectModal(plane, x, y) {
+            selectedPlaneForDefect = plane; defectModal.classList.remove('hidden');
+            defectModal.style.left = Math.min(x + 140, window.innerWidth - 140) + 'px'; defectModal.style.top = Math.min(y, window.innerHeight - 150) + 'px';
+        }
+        function closeDefectModal() { defectModal.classList.add('hidden'); selectedPlaneForDefect = null; }
+
+        window.confirmDefect = function(fault) {
+            if (selectedPlaneForDefect) {
+                const p = selectedPlaneForDefect; p.broken = true;
+                addLog(`<span style="color:#ef4444; font-weight:bold;">ВНИМАНИЕ!</span> Отказ [${fault}] на ВС ${p.id}. Поиск специалистов...`);
+                let candidates = findProposedMechanics(p, fault);
+                if (candidates.length === 0) { addLog(`Нет свободных техников [${fault}]. Заявка переведена в очередь.`); pendingFaults.push({plane: p, fault: fault}); closeDefectModal(); } else { showProposal(p, fault, candidates); closeDefectModal(); }
+            }
+        }
+
+        function showProposal(plane, fault, candidates) {
+            currentProposal = { plane, fault, candidates }; proposalList.innerHTML = '';
+            candidates.forEach((m, idx) => {
+                let distRaw = Math.hypot(m.x - plane.x, m.y - plane.y); let dist = Math.round(distRaw * 1.2); let etaMinutes = Math.max(1, Math.ceil(dist / 100));
+                let colorClass = idx === 0 ? 'bg-green-600 hover:bg-green-500' : 'bg-blue-600 hover:bg-blue-500';
+                let btn = document.createElement('button'); btn.className = `w-full text-left p-2 mb-2 rounded text-white text-xs transition ${colorClass}`;
+                btn.innerHTML = `<b>${idx + 1}. ${m.name}</b> (Квал: ${m.skill}⭐️)<br>Дистанция: ~${dist}м<br>Время в пути: ~${etaMinutes} мин.`;
+                btn.onclick = () => acceptProposal(m); proposalList.appendChild(btn);
+            });
+            proposalModal.classList.remove('hidden'); proposalModal.style.left = (window.innerWidth / 2) + 'px'; proposalModal.style.top = (window.innerHeight / 2) + 'px';
+        }
+
+        window.acceptProposal = function(mechanic) {
+            if (!currentProposal) return;
+            const p = currentProposal.plane; 
+            const fault = currentProposal.fault;
+            
+            mechanic.state = 'Идет к ВС'; 
+            mechanic.assignedPlane = p; 
+            mechanic.targetX = p.x + (Math.random()*40 - 20); 
+            mechanic.targetY = p.y + (Math.random()*40 - 20);
+            
+            addLog(`✅ Наряд передан! <b>${mechanic.name}</b> направляется к ${p.id}.`);
+            
+            currentProposal = null; 
+            proposalModal.classList.add('hidden');
+        }
+
+        window.cancelProposal = function() {
+            if (currentProposal) { pendingFaults.push({plane: currentProposal.plane, fault: currentProposal.fault}); addLog(`Заявка борта ${currentProposal.plane.id} отложена в очередь.`); }
+            currentProposal = null; proposalModal.classList.add('hidden');
+        }
+
+        window.addEventListener('mousemove', (e) => {
+            mouseX = e.clientX; mouseY = e.clientY; const mx = (e.clientX - offsetX) / scale; const my = (e.clientY - offsetY) / scale;
+            let hoveredMechanic = null;
+            for (let m of mechanics) { if (Math.hypot(m.x - mx, m.y - my) < 15) { hoveredMechanic = m; break; } }
+            if (hoveredMechanic) {
+                tooltip.style.opacity = '1'; tooltip.style.left = mouseX + 'px'; tooltip.style.top = mouseY + 'px';
+                document.getElementById('tt-name').innerText = `Техник: ${hoveredMechanic.name}`; document.getElementById('tt-spec').innerText = `Спец.: ${hoveredMechanic.specialty}`; document.getElementById('tt-skill').innerText = hoveredMechanic.skill;
+                const statusEl = document.getElementById('tt-status'); let dispStatus = hoveredMechanic.isWaitingForPlane ? 'Пропускает ВС' : hoveredMechanic.state; statusEl.innerText = dispStatus;
+                statusEl.className = 'badge '; if (dispStatus === 'Свободен') statusEl.classList.add('bg-free'); else if (dispStatus === 'Пропускает ВС') statusEl.classList.add('bg-wait'); else statusEl.classList.add('bg-busy');
+            } else { tooltip.style.opacity = '0'; }
+        });
+
+        function drawMap() {
+            ctx.fillStyle = '#3f4e45'; ctx.fillRect(0, 0, VIRTUAL_WIDTH, VIRTUAL_HEIGHT); 
+            ctx.fillStyle = '#2f3b46'; ctx.fillRect(MAP.apron.x, MAP.apron.y, MAP.apron.w, MAP.apron.h);
+            ctx.strokeStyle = '#3e4a56'; ctx.lineWidth = 1;
+            for(let ix = MAP.apron.x; ix < MAP.apron.x + MAP.apron.w; ix += 40) { ctx.beginPath(); ctx.moveTo(ix, MAP.apron.y); ctx.lineTo(ix, MAP.apron.y + MAP.apron.h); ctx.stroke(); }
+            for(let iy = MAP.apron.y; iy < MAP.apron.y + MAP.apron.h; iy += 40) { ctx.beginPath(); ctx.moveTo(MAP.apron.x, iy); ctx.lineTo(MAP.apron.x + MAP.apron.w, iy); ctx.stroke(); }
+            ctx.fillStyle = '#27313a';
+            for (let r of MAP.taxiways) { ctx.fillRect(r.x, r.y, r.w, r.h); ctx.strokeStyle = '#eab308'; ctx.lineWidth = 2; ctx.beginPath(); if (r.w > r.h) { ctx.moveTo(r.x, r.y + r.h/2); ctx.lineTo(r.x + r.w, r.y + r.h/2); } else { ctx.moveTo(r.x + r.w/2, r.y); ctx.lineTo(r.x + r.w/2, r.y + r.h); } ctx.stroke(); }
+            ctx.strokeStyle = '#eab308'; ctx.lineWidth = 2;
+            for (let spot of MAP.parkingSpots) { ctx.beginPath(); ctx.arc(spot.x, spot.y, 45, 0, Math.PI*2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(spot.x, spot.y); if (spot.type === 'top') ctx.lineTo(spot.x, MAP.taxiways[2].y); else ctx.lineTo(spot.x, MAP.taxiways[2].y + MAP.taxiways[2].h); ctx.stroke(); ctx.fillStyle = '#cbd5e1'; ctx.font = '16px Arial'; ctx.textAlign = 'center'; ctx.fillText(spot.id, spot.x - 35, spot.y - 35); }
+            ctx.fillStyle = '#1e293b'; ctx.fillRect(MAP.runway.x, MAP.runway.y, MAP.runway.w, MAP.runway.h);
+            ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 4; ctx.setLineDash([40, 40]); ctx.beginPath(); ctx.moveTo(MAP.runway.x, MAP.runway.y + MAP.runway.h/2); ctx.lineTo(MAP.runway.x + MAP.runway.w, MAP.runway.y + MAP.runway.h/2); ctx.stroke(); ctx.setLineDash([]);
+            ctx.fillStyle = '#e2e8f0'; ctx.fillRect(MAP.terminal.x, MAP.terminal.y, MAP.terminal.w, MAP.terminal.h);
+            ctx.fillStyle = '#1e293b'; ctx.font = 'bold 24px Inter, Arial'; ctx.textAlign = 'center'; ctx.fillText("ТЕРМИНАЛ АЭРОПОРТА", MAP.terminal.x + MAP.terminal.w/2, MAP.terminal.y + 40);
+            ctx.fillStyle = '#38bdf8'; ctx.globalAlpha = 0.5; ctx.fillRect(MAP.terminal.x + 20, MAP.terminal.y + 60, MAP.terminal.w - 40, 45); ctx.globalAlpha = 1.0;
+            ctx.fillStyle = '#94a3b8'; const gateW = 60; const gateSpacing = (MAP.terminal.w - 4 * gateW) / 5;
+            for(let i=0; i<4; i++) { const gx = MAP.terminal.x + gateSpacing + i * (gateW + gateSpacing); ctx.fillRect(gx, MAP.terminal.y + 120, gateW, 60); ctx.fillStyle = '#334155'; ctx.fillRect(gx + 15, MAP.terminal.y + 160, 30, 20); ctx.fillStyle = '#94a3b8'; }
+            ctx.fillStyle = '#64748b'; ctx.fillRect(MAP.techBase.x, MAP.techBase.y, MAP.techBase.w, MAP.techBase.h); ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 4; ctx.strokeRect(MAP.techBase.x, MAP.techBase.y, MAP.techBase.w, MAP.techBase.h); ctx.fillStyle = '#ffffff'; ctx.font = 'bold 18px Inter, Arial'; ctx.textAlign = 'center'; ctx.fillText("ТЕХ. БАЗА АТБ", MAP.techBase.x + MAP.techBase.w/2, MAP.techBase.y + 30);
+            ctx.fillStyle = '#94a3b8'; ctx.fillRect(MAP.topMaint.x, MAP.topMaint.y, MAP.topMaint.w, MAP.topMaint.h); ctx.fillStyle = '#0f172a'; ctx.font = 'bold 16px Inter'; ctx.fillText("ЗДАНИЕ", MAP.topMaint.x + MAP.topMaint.w/2, MAP.topMaint.y + MAP.topMaint.h/2 - 25); ctx.fillText("ТЕХОБСЛУЖ 1", MAP.topMaint.x + MAP.topMaint.w/2, MAP.topMaint.y + MAP.topMaint.h/2 - 5); ctx.fillStyle = '#1e293b'; ctx.fillRect(MAP.topMaint.x + MAP.topMaint.w - 20, MAP.topMaint.y + MAP.topMaint.h/2 - 25, 20, 50);
+            ctx.fillStyle = '#94a3b8'; ctx.fillRect(MAP.bottomMaint.x, MAP.bottomMaint.y, MAP.bottomMaint.w, MAP.bottomMaint.h); ctx.fillStyle = '#0f172a'; ctx.font = 'bold 16px Inter'; ctx.fillText("ЗДАНИЕ ТЕХОБСЛУЖ 2", MAP.bottomMaint.x + MAP.bottomMaint.w/2, MAP.bottomMaint.y + 45); ctx.fillStyle = '#1e293b'; ctx.fillRect(MAP.bottomMaint.x + MAP.bottomMaint.w/2 - 30, MAP.bottomMaint.y, 60, 20);
+            drawATCTower();
+        }
+
+        function drawATCTower() {
+            const tx = MAP.tower.x; const ty = MAP.tower.y;
+            ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.beginPath(); ctx.ellipse(tx, ty + 120, 60, 20, 0, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#334155'; ctx.beginPath(); ctx.moveTo(tx - 35, ty + 120); ctx.lineTo(tx + 35, ty + 120); ctx.lineTo(tx + 25, ty); ctx.lineTo(tx - 25, ty); ctx.fill();
+            ctx.fillStyle = '#1e293b'; ctx.fillRect(tx - 50, ty - 5, 100, 10);
+            ctx.fillStyle = dispatcher.alert ? `rgba(239, 68, 68, ${0.4 + Math.sin(Date.now()/150)*0.4})` : 'rgba(56, 189, 248, 0.3)'; ctx.fillRect(tx - 45, ty - 65, 90, 60); ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 2; ctx.strokeRect(tx - 45, ty - 65, 90, 60);
+            ctx.fillStyle = '#0f172a'; ctx.beginPath(); ctx.arc(tx - 15, ty - 35, 6, 0, Math.PI*2); ctx.fill(); ctx.fillRect(tx - 22, ty - 28, 14, 23); ctx.fillStyle = '#475569'; ctx.fillRect(tx - 5, ty - 25, 25, 20); ctx.fillStyle = '#22d3ee'; ctx.fillRect(tx - 2, ty - 30, 8, 5); ctx.fillRect(tx + 8, ty - 30, 8, 5);
+            ctx.fillStyle = '#451a03'; ctx.fillRect(tx + 30, ty - 25, 10, 20); ctx.fillStyle = '#ef4444'; ctx.fillRect(tx + 32, ty - 20, 3, 3); ctx.fillStyle = '#d1d5db'; ctx.fillRect(tx + 32, ty - 10, 6, 5); 
+            ctx.fillStyle = '#1e293b'; ctx.beginPath(); ctx.moveTo(tx - 50, ty - 65); ctx.lineTo(tx + 50, ty - 65); ctx.lineTo(tx + 30, ty - 85); ctx.lineTo(tx - 30, ty - 85); ctx.fill();
+            ctx.save(); ctx.translate(tx, ty - 95); ctx.rotate(Date.now() / 300); ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-20, 0); ctx.lineTo(20, 0); ctx.stroke(); ctx.restore();
+            ctx.fillStyle = '#94a3b8'; ctx.fillRect(tx - 2, ty - 95, 4, 10);
+        }
+
+        let lastTime = 0; let spawnCooldown = 1; 
+
+        function gameLoop(timestamp) {
+            if (!lastTime) lastTime = timestamp; const dt = (timestamp - lastTime) / 1000; lastTime = timestamp; gameTimeSeconds += dt * 30;
+            if (spawnCooldown > 0) { spawnCooldown -= dt; } else if (planes.length < TARGET_CONCURRENT_PLANES) {
+                let spawnClear = true; for (let p of planes) { if (p.x < 150 && p.state === 'ПОДЛЕТ') { spawnClear = false; break; } }
+                if (spawnClear) { let freeSpots = MAP.parkingSpots.filter(s => s.occupiedBy === null); if (freeSpots.length > 0) { let plane = new Plane(); let targetSpot = freeSpots[Math.floor(Math.random() * freeSpots.length)]; plane.assignSpot(targetSpot); planes.push(plane); spawnCooldown = 6 + Math.random() * 4; } }
+            }
+            for (let i = planes.length - 1; i >= 0; i--) { planes[i].update(dt); if (planes[i].state === 'УЛЕТЕЛ') { addLog(`Рейс ${planes[i].id} успешно покинул зону аэропорта.`); planes.splice(i, 1); } }
+            for (let i = serviceVehicles.length - 1; i >= 0; i--) { serviceVehicles[i].update(dt); if (serviceVehicles[i].state === 'ГОТОВО') serviceVehicles.splice(i, 1); }
+            for (let m of mechanics) m.update(dt);
+            ctx.save(); ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.translate(offsetX, offsetY); ctx.scale(scale, scale);
+            drawMap(); for (let p of planes) p.draw(ctx); for (let v of serviceVehicles) v.draw(ctx); for (let m of mechanics) m.draw(ctx);
+            if (currentProposal) {
+                ctx.lineWidth = 3; ctx.setLineDash([8, 8]);
+                currentProposal.candidates.forEach((m, idx) => { ctx.strokeStyle = idx === 0 ? '#4ade80' : '#3b82f6'; ctx.beginPath(); ctx.moveTo(m.x, m.y); ctx.lineTo(currentProposal.plane.x, currentProposal.plane.y); ctx.stroke(); ctx.beginPath(); ctx.arc(m.x, m.y, 16, 0, Math.PI * 2); ctx.stroke(); });
+                ctx.setLineDash([]);
+            }
+            ctx.restore(); requestAnimationFrame(gameLoop);
+        }
+        addLog("КДП онлайн. Оператор на месте. Ожидание рейсов..."); requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, points_json=json.dumps(POINTS, ensure_ascii=False), faults_json=json.dumps(FAULT_TYPES, ensure_ascii=False))
+
+@app.route('/employee')
+def employee_page():
+    return render_template_string(EMPLOYEE_HTML, points_json=json.dumps(POINTS, ensure_ascii=False))
+
+@app.route('/sim')
+def simulation_page():
+    return Response(SIMULATION_HTML, mimetype='text/html; charset=utf-8')
+
+@app.route('/api/points')
+def api_points(): return jsonify(POINTS)
+
+@app.route('/api/employees')
+def api_employees(): return jsonify(list(employees.values()))
+
+@app.route('/api/fault_types')
+def api_fault_types(): return jsonify(FAULT_TYPES)
+
+@app.route('/api/create_request', methods=['POST'])
+def api_create_request():
+    data = request.json
+    rid = str(uuid.uuid4())[:8]
+    req = { "id": rid, "stand_id": data["stand_id"], "stand_name": POINTS[data["stand_id"]]["name"], "board_number": data.get("board_number", "RA-12345"), "fault_type": data["fault_type"], "fault_name": FAULT_TYPES[data["fault_type"]]["name"], "status": "open", "created_at": datetime.now().strftime("%H:%M:%S"), "candidates": find_candidates(data["stand_id"], data["fault_type"]) }
+    requests_db[rid] = req
+    log_event("Заявка " + rid + ": " + req["stand_name"] + ", борт " + req["board_number"] + ", " + req["fault_name"])
+    emit_all_state()
+    return jsonify(req)
+
+@app.route('/api/assign', methods=['POST'])
+def api_assign():
+    data = request.json
+    rid, eid = data["request_id"], data["employee_id"]
+    req, emp = requests_db.get(rid), employees.get(eid)
+    if not req or not emp: return jsonify({"error": "not found"}), 404
+    cand = next((c for c in req["candidates"] if c["emp_id"] == eid), None)
+    aid = str(uuid.uuid4())[:8]
+    assignment = { "id": aid, "request_id": rid, "employee_id": eid, "employee_name": emp["name"], "stand_id": req["stand_id"], "stand_name": req["stand_name"], "board_number": req["board_number"], "fault_type": req["fault_type"], "fault_name": req["fault_name"], "eta_min": cand["eta_min"] if cand else 0, "by_truck": cand["by_truck"] if cand else False, "status": "assigned", "created_at": datetime.now().strftime("%H:%M:%S") }
+    assignments_db[aid] = assignment
+
+    if emp["name"] == "Иванов И.И.":
+        emp["status"], req["status"] = "assigned", "assigned"
+        log_event("Назначение: " + emp["name"] + " -> " + req["stand_name"] + " (Ожидание подтверждения)")
+        socketio.emit('assignment_notification', {"employee_id": eid, "assignment": assignment})
+    else:
+        assignment["status"], emp["status"], req["status"] = "accepted", "enroute", "assigned"
+        emp["target_lat"], emp["target_lon"] = POINTS[req["stand_id"]]["lat"], POINTS[req["stand_id"]]["lon"]
+        log_event("Назначение: " + emp["name"] + " -> " + req["stand_name"] + " (Авто-выезд)")
+        
+    emit_all_state()
+    return jsonify(assignment)
+
+@app.route('/api/stats')
+def api_stats(): return jsonify(get_stats())
+
+@app.route('/api/test/<int:scenario>')
+def api_test(scenario):
+    if scenario == 1:
+        for emp in employees.values(): emp["target_lat"], emp["target_lon"], emp["status"] = POINTS["atb"]["lat"], POINTS["atb"]["lon"], "enroute"
+    elif scenario == 2:
+        pts = [k for k in POINTS.keys() if not k.startswith("stand")]
+        for emp in employees.values():
+            pt = POINTS[random.choice(pts)]
+            emp["target_lat"], emp["target_lon"], emp["status"] = pt["lat"], pt["lon"], "enroute"
+    elif scenario == 3:
+        for emp in employees.values(): emp["status"] = "busy"
+    elif scenario == 4:
+        for emp in employees.values(): emp["target_lat"], emp["target_lon"], emp["status"] = POINTS["truck_n"]["lat"], POINTS["truck_n"]["lon"], "enroute"
+    elif scenario == 6:
+        for emp in employees.values(): emp["status"], emp["target_lat"], emp["target_lon"] = "free", None, None
+    elif scenario == 7:
+        requests_db.clear(); assignments_db.clear()
+        for emp in employees.values():
+            if emp["name"] != "Иванов И.И.": emp["status"], emp["target_lat"], emp["target_lon"], emp["busy_until"] = "free", None, None, None
+        log_event("Сброс всех заявок и статусов.")
+    emit_all_state()
+    return jsonify({"status": "ok"})
+
+@app.route('/api/android/login', methods=['POST'])
+def android_login():
+    name = request.json.get("name", "")
+    for eid, emp in employees.items():
+        if emp["name"] == name:
+            log_event("Вход сотрудника: " + name)
+            return jsonify({"employee_id": eid, "status": "ok"})
+    return jsonify({"error": "Сотрудник не найден"}), 404
+
+@app.route('/api/android/status', methods=['POST'])
+def android_status():
+    eid, new_status = request.json.get("employee_id"), request.json.get("status")
+    if eid in employees:
+        emp = employees[eid]
+        if new_status == "return_to_base":
+            for aid, a in list(assignments_db.items()):
+                if a["employee_id"] == eid and a["status"] in ("assigned", "accepted"):
+                    a["status"] = "completed"
+                    if a["request_id"] in requests_db: requests_db[a["request_id"]]["status"] = "completed"
+            emp["target_lat"], emp["target_lon"], emp["status"] = POINTS["atb"]["lat"], POINTS["atb"]["lon"], "enroute"
+            log_event(emp["name"] + " успешно завершил работу на ВС и возвращается в АТБ.")
+            emit_all_state()
+            return jsonify({"status": "ok"})
+        if new_status in ("free", "busy", "enroute"):
+            old = emp["status"]
+            emp["status"] = new_status
+            log_event(emp["name"] + ": " + old + " -> " + new_status)
+            emit_all_state()
+            return jsonify({"status": "ok"})
+    return jsonify({"error": "not found"}), 404
+
+@app.route('/api/android/assignment_respond', methods=['POST'])
+def android_respond():
+    eid, aid, accepted = request.json.get("employee_id"), request.json.get("assignment_id"), request.json.get("accepted", True)
+    if aid in assignments_db and assignments_db[aid]["employee_id"] == eid:
+        if accepted:
+            assignments_db[aid]["status"] = "accepted"
+            log_event(employees[eid]["name"] + " принял назначение!")
+            stand_id = assignments_db[aid]["stand_id"]
+            employees[eid]["target_lat"], employees[eid]["target_lon"], employees[eid]["status"] = POINTS[stand_id]["lat"], POINTS[stand_id]["lon"], "enroute"
+        else:
+            assignments_db[aid]["status"] = "rejected"
+            employees[eid]["status"], employees[eid]["target_lat"], employees[eid]["target_lon"] = "free", None, None
+            log_event(employees[eid]["name"] + " отклонил назначение!")
+        emit_all_state()
+        return jsonify({"status": "ok"})
+    return jsonify({"error": "not found"}), 404
+
+@socketio.on('connect')
+def on_connect(): emit_all_state()
+
+@socketio.on('request_state')
+def on_request_state(): emit_all_state()
+
+if __name__ == '__main__':
+    init_test_employees()
+    socketio.start_background_task(gps_tracking_loop)
+    socketio.run(app, host='0.0.0.0', port=5000)
