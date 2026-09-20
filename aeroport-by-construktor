@@ -21,7 +21,6 @@ app.config['SECRET_KEY'] = 'aerodispatch-secret'
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
 
-# ─── КОНСТАНТЫ И ТОЧКИ YANDEX MAPS (Идеально выровнены по фото) ───
 WALK_SPEED = 5.0
 TRUCK_SPEED = 25.0
 REGLEMENT_MIN = 15
